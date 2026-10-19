@@ -55,6 +55,15 @@
 | [testing/README.md](testing/README.md) | Testing harness setup and conventions |
 | [shared/README.md](shared/README.md) | Shared library utilities and helpers |
 | [security/README.md](security/README.md) | Security model and access control overview |
+| [docs/WORKERS.md](docs/WORKERS.md) | Background worker framework: job lifecycle, retry policy, dead letters, local runner |
+| [docs/PROGRESSIVE_DISCLOSURE.md](docs/PROGRESSIVE_DISCLOSURE.md) | Advanced transaction detail fields, and why critical warnings can't end up advanced-only |
+| [docs/CHANGELOG_SCHEMA.md](docs/CHANGELOG_SCHEMA.md) | The machine-readable changelog (`changelog/entries.json`): schema, validation, when an entry is required |
+| [docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md) | The PR checklist, what's automated vs. reviewer judgment, and the emergency-fix exception process |
+| [docs/SECURITY_INVARIANTS.md](docs/SECURITY_INVARIANTS.md) | Formal protocol invariants (token conservation, referral acyclicity, oracle quorum/staleness, admin non-revocability) with the code and error variant that enforces each one |
+| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | Trust assumptions, adversarial attack vectors per contract family, and pause/emergency-response pointers |
+| [docs/AUDIT_LEDGER.md](docs/AUDIT_LEDGER.md) | Tamper-evident hash-chained ledger for privileged/financial events: hashing rules, verification, export, failure modes, and recovery runbook |
+| [docs/SYNTHETIC_JOURNEY_MONITOR.md](docs/SYNTHETIC_JOURNEY_MONITOR.md) | Runnable fund/quote/settle synthetic monitor, failure attribution, and recovery guidance |
+| [docs/RECONCILIATION_JOB.md](docs/RECONCILIATION_JOB.md) | Projection reconciliation job: comparing canonical truth with derived state, dry-run safety, and idempotent repair |
 - Storage Layout
 - Documentation
 - Contribution Guide
@@ -3732,6 +3741,9 @@ This repository contains comprehensive documentation for contract design, gas op
 - [**UPGRADEABILITY.md**](UPGRADEABILITY.md) — System-wide upgrade registry and safe contract upgrade patterns with migration hooks and pre/post-upgrade validation.
 - [**GAS_OPTIMIZATION.md**](GAS_OPTIMIZATION.md) — Gas optimization principles, applied optimizations, benchmark infrastructure, and a checklist for new features.
 - [**SECURITY_BATCH.md**](SECURITY_BATCH.md) — Security analysis of batch operations including reentrancy protection, input validation, and failure semantics.
+- [**docs/IMPORT_PIPELINE.md**](docs/IMPORT_PIPELINE.md) — Bulk import pipeline with pre-flight dry-run validation, duplicate detection, and prescriptive rollback guidance.
+- [**docs/PREFLIGHT.md**](docs/PREFLIGHT.md) — Deterministic pre-submission preflight for high-risk operations with ready/warning/blocked verdicts, remediation steps, and shared error mapping.
+- [**docs/AUDIT_LEDGER.md**](docs/AUDIT_LEDGER.md) — Append-only hash-chained ledger for privileged and financial events: hashing definition, verification and export APIs, failure-mode table, and rollback/recovery runbook.
 
 ## Module Documentation
 

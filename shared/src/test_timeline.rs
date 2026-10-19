@@ -4,19 +4,21 @@ extern crate std;
 
 use soroban_sdk::{
     contract, contractimpl, symbol_short,
-    testutils::{Address as _, Ledger as _},
-    Address, Bytes, Env, Vec,
+    testutils::{Address as _, Events as _, Ledger as _},
+    Address, Bytes, Env, FromVal, IntoVal, Vec,
 };
 
 use crate::{
     auth::{grant_role, set_admin, Role},
     errors::Error,
     timeline::{
-        anonymous_viewer, append_user_event, audit_trail, can_view, delete_entry, entry_count,
-        entry_exists, entry_is_redacted, is_maintainer, record_audit_event, redact_entry,
-        timeline_page, viewer_for, ResourceLink, TimelineEntry, TimelineEventType, Visibility,
-        DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
+        action_audit_trail, anonymous_viewer, append_user_event, audit_trail, can_view,
+        delete_entry, entry_count, entry_exists, entry_is_redacted, is_maintainer,
+        record_action_audit_event, record_audit_event, redact_entry, timeline_page, viewer_for,
+        ResourceLink, TimelineEntry, TimelineEventType, Visibility, DEFAULT_PAGE_SIZE,
+        MAX_PAGE_SIZE,
     },
+    time_window::{TimeWindow, TimeWindowError, validate_time_window},
 };
 
 #[contract]
@@ -27,10 +29,18 @@ impl DummyTimelineContract {
     pub fn noop(_env: Env) {}
 }
 
+#[contractimpl]
+impl DummyTimelineContract {
+    pub fn scheduled(_env: Env, window: TimeWindow) -> Result<(), TimeWindowError> {
+        validate_time_window(&_env, &window)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixture
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct Ctx {
     env: Env,
     id: Address,
@@ -75,6 +85,10 @@ fn setup() -> Ctx {
         bob,
         stranger,
     }
+}
+
+fn window(env: &Env, start: u64, end: u64) -> TimeWindow {
+    TimeWindow { start, end }
 }
 
 fn link(env: &Env, id: u64, revision: u32) -> ResourceLink {
@@ -315,10 +329,55 @@ fn audit_entries_never_appear_in_the_user_timeline() {
 }
 
 #[test]
+fn action_audit_records_actor_scope_reason_timestamp_and_state_context() {
+    let ctx = setup();
+    let entry = ctx.run(|| {
+        record_action_audit_event(
+            &ctx.env,
+            &ctx.alice,
+            TimelineEventType::ConfigChanged,
+            link(&ctx.env, 9, 2),
+            symbol_short!("treasury"),
+            symbol_short!("wd_limit"),
+            symbol_short!("admin_cfg"),
+            None,
+            None,
+            Some(100),
+            Some(250),
+        )
+        .unwrap()
+    });
+
+    assert_eq!(entry.actor, ctx.alice);
+    assert_eq!(entry.scope, symbol_short!("treasury"));
+    assert_eq!(entry.action, symbol_short!("wd_limit"));
+    assert_eq!(entry.reason, symbol_short!("admin_cfg"));
+    assert_eq!(entry.resource, None);
+    assert_eq!(entry.attribute, None);
+    assert_eq!(entry.before, Some(100));
+    assert_eq!(entry.after, Some(250));
+    assert_eq!(entry.ledger, ctx.env.ledger().sequence());
+    assert_eq!(entry.timestamp, ctx.env.ledger().timestamp());
+    let event = ctx.env.events().all().last().unwrap();
+    assert_eq!(
+        event.1,
+        (symbol_short!("timeline"), symbol_short!("audit_v2")).into_val(&ctx.env)
+    );
+    let event_entry: crate::timeline::ActionAuditEntry = FromVal::from_val(&ctx.env, &event.2);
+    assert_eq!(event_entry, entry);
+    let queried = ctx.run(|| action_audit_trail(&ctx.env, &ctx.admin, 0).unwrap());
+    assert_eq!(queried, soroban_sdk::Vec::from_array(&ctx.env, [entry]));
+}
+
+#[test]
 fn audit_trail_requires_admin_role() {
     let ctx = setup();
     assert_eq!(
         ctx.run(|| audit_trail(&ctx.env, &ctx.stranger, 0)),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        ctx.run(|| action_audit_trail(&ctx.env, &ctx.stranger, 0)),
         Err(Error::Unauthorized)
     );
     assert_eq!(
@@ -536,4 +595,95 @@ fn append_rejects_a_non_canonical_resource_kind() {
         res.is_err(),
         "an unbounded resource kind must not be stored"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Time-window validation for scheduled actions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scheduled_action_before_window_is_rejected_as_early() {
+    let ctx = setup();
+    ctx.run(|| ctx.env.ledger().set_timestamp(100));
+    let res = ctx.run(|| validate_time_window(&ctx.env, &window(&ctx.env, 200, 300)));
+    assert_eq!(res, Err(TimeWindowError::TooEarly));
+}
+
+#[test]
+fn scheduled_action_inside_window_is_accepted() {
+    let ctx = setup();
+    ctx.run(|| ctx.env.ledger().set_timestamp(250));
+    let res = ctx.run(|| validate_time_window(&ctx.env, &window(&ctx.env, 200, 300)));
+    assert_eq!(res, Ok(()));
+}
+
+#[test]
+fn scheduled_action_after_window_is_rejected_as_late() {
+    let ctx = setup();
+    ctx.run(|| ctx.env.ledger().set_timestamp(400));
+    let res = ctx.run(|| validate_time_window(&ctx.env, &window(&ctx.env, 200, 300)));
+    assert_eq!(res, Err(TimeWindowError::Expired));
+}
+
+#[test]
+fn scheduled_action_at_window_boundaries_is_accepted() {
+    let ctx = setup();
+    ctx.run(|| ctx.env.ledger().set_timestamp(200));
+    assert_eq!(
+        ctx.run(|| validate_time_window(&ctx.env, &window(&ctx.env, 200, 300))),
+        Ok(())
+    );
+    ctx.run(|| ctx.env.ledger().set_timestamp(300));
+    assert_eq!(
+        ctx.run(|| validate_time_window(&ctx.env, &window(&ctx.env, 200, 300))),
+        Ok(())
+    );
+}
+
+#[test]
+fn scheduled_action_with_stale_timestamp_is_rejected() {
+    let ctx = setup();
+    // Ledger time is set to a value that would be "inside" a manipulated
+    // window, but the window itself is stale (end < start).
+    ctx.run(|| ctx.env.ledger().set_timestamp(250));
+    let res = ctx.run(|| validate_time_window(&ctx.env, &window(&ctx.env, 300, 200)));
+    assert_eq!(res, Err(TimeWindowError::Stale));
+}
+
+#[test]
+fn scheduled_action_with_manipulated_timestamp_is_rejected() {
+    let ctx = setup();
+    // A caller-supplied window whose start is in the future relative to the
+    // ledger must not be accepted just because the caller claims it is valid.
+    ctx.run(|| ctx.env.ledger().set_timestamp(50));
+    let res = ctx.run(|| validate_time_window(&ctx.env, &window(&ctx.env, 100, 200)));
+    assert_eq!(res, Err(TimeWindowError::TooEarly));
+}
+
+#[test]
+fn scheduled_action_emits_clear_error_events() {
+    let ctx = setup();
+    ctx.run(|| ctx.env.ledger().set_timestamp(100));
+    let _ = ctx.run(|| validate_time_window(&ctx.env, &window(&ctx.env, 200, 300)));
+    let events = ctx.env.events().all();
+    assert!(
+        events.len() > 0,
+        "a rejection must emit a diagnostic event"
+    );
+}
+
+#[test]
+fn scheduled_contract_entrypoint_rejects_early_and_late() {
+    let ctx = setup();
+    ctx.run(|| ctx.env.ledger().set_timestamp(100));
+    let early = ctx.run(|| {
+        DummyTimelineContract::scheduled(ctx.env.clone(), window(&ctx.env, 200, 300))
+    });
+    assert_eq!(early, Err(TimeWindowError::TooEarly));
+
+    ctx.run(|| ctx.env.ledger().set_timestamp(400));
+    let late = ctx.run(|| {
+        DummyTimelineContract::scheduled(ctx.env.clone(), window(&ctx.env, 200, 300))
+    });
+    assert_eq!(late, Err(TimeWindowError::Expired));
 }

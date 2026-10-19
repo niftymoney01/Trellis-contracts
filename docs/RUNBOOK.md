@@ -27,6 +27,9 @@ commands, the decision points, and the rollback / mitigation paths.
    # Contract/config diagnostics (RPC reachability, network id, flags).
    ./scripts/diagnostics.sh
 
+   # Cross-contract wiring smoke test (read-only, see §7).
+   ./scripts/verify-deployment.sh "$NETWORK"
+
    # Confirm the deployed network + contract ids recorded at deploy time.
    cat DEPLOYMENTS.md
    ```
@@ -47,8 +50,10 @@ commands, the decision points, and the rollback / mitigation paths.
 | Upgrade | `UpgradeAlreadyPending` (906), `MigrationHookFailed` (905) | Stuck release | §3.5 |
 | Escrow / payments | `PaymentEscrow*` (700–710) | Stuck or double release | §3.6 |
 | Quota / abuse | `QuotaExceeded` (22) by many actors | Legit users blocked | §3.7 |
+| Bulk imports | `BatchTooLarge` (940), `InvalidRow` (944), `DuplicateExternalId` (943) | Failed dataset ingest | §3.8 |
+| Metadata retention | Unminimized leak, premature purge, hold collision | Lost audit / PII leak | §3.9 |
 
-Error codes are defined in [`shared/src/errors.rs`](../shared/src/errors.rs).
+Error codes are defined in [`shared/src/errors.rs`](../shared/src/errors.rs) and [`shared/src/release_readiness.rs`](../shared/src/release_readiness.rs).
 
 ---
 
@@ -109,6 +114,9 @@ cargo test -p shared compat:: -- --nocapture
   record. Redeploy the current build; do **not** hand-edit ledger entries.
 - `SchemaMigrationFailed` on write → validate the record shape and re-run the
   migration path described in [`COMPATIBILITY.md`](./COMPATIBILITY.md).
+- To backfill legacy records or reconcile missing derived indexes, run the
+  operator-safe [Backfill Tool](BACKFILL_TOOL.md):
+  `./scripts/backfill.sh --module <mod> --input <file> [--dry-run | --apply]`.
 
 ### 3.5 Upgrade
 
@@ -152,6 +160,13 @@ soroban contract invoke --id "$CONTRACT_ID" --network "$NETWORK" \
 `set_quota_config`. Treat a broad `QuotaExceeded` spike as an abuse signal and
 escalate to security.
 
+### 3.8 Operational metadata retention & minimization
+
+For operational metadata data minimization reviews, retention enforcement, holds, and testable cleanup procedures across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules, follow [`docs/OPERATIONAL_METADATA_RETENTION.md`](./OPERATIONAL_METADATA_RETENTION.md).
+
+- **Hold emergency**: Place an indefinite hold (`place_operational_hold`) to protect disputed operational metadata from automated cleanup runs.
+- **Accidental override**: Clear or reset custom retention policy override to restore safe compile-time defaults.
+
 ---
 
 ## 4. Persistent storage TTL renewal
@@ -173,6 +188,74 @@ the key through the helper, and verifies that the entry remains available.
 The current seven-day bump and six-day refresh threshold are defined in
 `shared/src/storage.rs`; change those constants deliberately and review the
 gas impact before deployment.
+
+### 3.8 Bulk import failures & remediation
+
+When a bulk import (`import_aids`) encounters invalid rows or duplicate collisions:
+
+1. **Check Dry-Run First**:
+   Always execute `import_aids_dry_run` before committing. If errors are reported,
+   refer to the returned `RollbackGuidance` and inspect `RowError` entries.
+2. **Atomic Revert (`atom_rev`)**:
+   Under `AllOrNothing` mode, any validation error prevents all persistent writes.
+   Fix the identified rows in the source batch and re-submit.
+3. **Partial Ingest (`part_rem`)**:
+   Under `BestEffort` mode, valid rows are durably written while invalid rows are
+   recorded in `report.errors`. Extract failing `row_id` entries, correct fields,
+   and resubmit either as a delta batch or with `DuplicatePolicy::SkipExisting`
+   to safely skip previously imported records.
+
+See [`IMPORT_PIPELINE.md`](./IMPORT_PIPELINE.md) for complete validation rules and runbooks.
+
+### 3.9 Feature rollout guard & rollback verification
+
+When an alert reports an automatic rollback (`AutomaticRollbackTriggered` 963) or degraded rollout health:
+
+1. **Check Rollout Guard Status**:
+   ```bash
+   soroban contract invoke \
+     --id "$CONTRACT_ID" --network "$NETWORK" --source-account "$READ_ONLY_ACCOUNT" \
+     -- get_guard_config --target "$TARGET_SYMBOL"
+   ```
+   Confirm that `stage` is `RolledBack` and `rollout_bps` is `0`.
+2. **Review Rollback Audit**:
+   Inspect the stored `RollbackAuditRecord` for `reason` (e.g. `ConsecutiveFailuresExceeded`, `ErrorRateBreached`, `InvariantViolation`) and `failing_error_code`.
+3. **Execute Post-Rollback Verification**:
+   ```bash
+   soroban contract invoke \
+     --id "$CONTRACT_ID" --network "$NETWORK" --source-account "$ADMIN_ACCOUNT" \
+     -- verify_rollback --target "$TARGET_SYMBOL"
+   ```
+   Confirm `verified_clean: true`. If `verified_clean: false`, check `anomaly` (such as `SolvencyDiscrepancy` or `OrphanedPartialRecord`) and run module remediation before re-enabling.
+4. **Re-arming Protection**:
+   Do not attempt to re-enable the feature until `verify_rollback` has confirmed a clean state.
+
+See [`FEATURE_FLAG_ROLLOUT_GUARD.md`](./FEATURE_FLAG_ROLLOUT_GUARD.md) for complete details.
+
+### 3.10 Release readiness gate & rollback rehearsal failures
+
+When a pull request, CI pipeline, or release promotion is blocked by the Release Readiness Gate:
+
+1. **Diagnose Gate Blockers**:
+   Execute the release readiness evaluation tool locally to isolate the failing gate:
+   ```bash
+   node scripts/release-readiness-gate.cjs --check-all
+   ```
+2. **Resolve by Gate Type**:
+   - **Migrations Gate (`MissingMigrationVerification`, 971)**:
+     Ensure schema versioning guards are active (`docs/STORAGE_SCHEMA_GUARDS.md`), run `shared::migration::dry_run(&plan)`, and ensure any breaking changes in `changelog/entries.json` contain non-empty `migration_notes`.
+   - **Security Gate (`MissingSecurityCheck`, 972)**:
+     Run `./scripts/security/run-audit.sh`. If an allowlist entry expired in `security/audit-allowlist.toml`, renew or remove it.
+   - **Smoke Tests Gate (`MissingSmokeTest`, 973)**:
+     Run `node scripts/verify-deployment.cjs <network>` to verify cross-contract getters and zero-value simulations across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules.
+   - **Rollback Rehearsals Gate (`MissingRollbackRehearsal`, 974)**:
+     Execute a simulated rollback rehearsal using `shared::release_readiness::rehearse_rollback` proving state preservation upon reverting to previous WASM.
+3. **Emergency Bypass (Incident Only)**:
+   If an emergency hotfix cannot await complete non-critical checks, append the documented exception marker to the PR body:
+   ```markdown
+   <!-- release-readiness-exception: <Incident ID, emergency rationale, and approving tech lead> -->
+   ```
+   See [`RELEASE_READINESS.md`](./RELEASE_READINESS.md) for full gate specifications.
 
 ## 5. Emergency rollback
 
@@ -235,6 +318,8 @@ post-incident note: root cause, detection gap, and follow-up issues.
 
 ## 6. Reference
 
+- [`FEATURE_FLAG_ROLLOUT_GUARD.md`](./FEATURE_FLAG_ROLLOUT_GUARD.md) — feature-flag rollout guard, automatic rollback triggers, and verification receipts.
+- [`IMPORT_PIPELINE.md`](./IMPORT_PIPELINE.md) — bulk import validation, dry-run simulation, and remediation runbooks.
 - [`DIAGNOSTICS.md`](./DIAGNOSTICS.md) — diagnostic tooling details.
 - [`QUOTA.md`](./QUOTA.md) — quota limits and override procedure.
 - [`COMPATIBILITY.md`](./COMPATIBILITY.md) — schema versions and migration.
@@ -242,3 +327,101 @@ post-incident note: root cause, detection gap, and follow-up issues.
 - [`../UPGRADEABILITY.md`](../UPGRADEABILITY.md) — upgrade registry and rollback.
 - [`../DEPLOYMENTS.md`](../DEPLOYMENTS.md) — deployed contract ids per network.
 - [`../SECURITY.md`](../SECURITY.md) — disclosure and key-compromise steps.
+
+---
+
+## 7. Deployment verification smoke test
+
+After every testnet/mainnet deploy — and before declaring a deployment incident
+resolved — run the cross-contract smoke test. It reads the recorded addresses
+and queries each contract's read-only getters on-chain to prove the deployment
+is wired together. `scripts/deploy.sh` can succeed while a missed
+`scripts/initialize.sh` wiring step leaves claims and payouts failing on-chain;
+this is the one command that catches that.
+
+### 7.1 What it checks
+
+| Check | Getter | Expected |
+|---|---|---|
+| Aid → Treasury | `AidContract::get_treasury` | deployed `treasury-contract` id |
+| Treasury → Referral | `TreasuryContract::referral_contract` | deployed `referral-contract` id |
+| Referral → Treasury | `ReferralContract::get_treasury` | deployed `treasury-contract` id |
+| Registry coverage | `RegistryContract::get_contract(name)` | every deployed contract resolves to its recorded id |
+| Invocation | read-only getter per core contract | contract reachable and callable by the configured source |
+
+The invocation check is a zero-value, read-only simulation (`--send=no`); it
+never signs or submits a state-changing transaction and never moves funds.
+
+### 7.2 Usage
+
+```bash
+# Linux/macOS — run from the repo root
+./scripts/verify-deployment.sh testnet
+
+# Windows / cross-platform Node runner (same checks, same options)
+node scripts/verify-deployment.cjs testnet
+```
+
+Common options (both runners):
+
+| Flag | Purpose |
+|---|---|
+| `--network <net>` | `testnet` (default) or `mainnet` |
+| `--deployments <file>` | Deployment JSON from `deploy.sh` (default `.deployment-log-<net>.json`) |
+| `--deployments-md <file>` | Markdown fallback (default `DEPLOYMENTS.md`) |
+| `--source <identity>` | Soroban source identity (default `admin`) |
+| `--rpc-url <url>` | Override the RPC endpoint |
+| `--registry-name k=sym` | Override the registry `Symbol` checked for contract `k` |
+| `--skip-simulation` | Skip the invocation simulation |
+| `--json` | Machine-readable summary (for CI) |
+
+If the deployment JSON is absent the runner falls back to the network table in
+`DEPLOYMENTS.md`. If neither has addresses it exits `2` with an actionable
+error:
+
+```
+VERIFY ERROR: testnet contracts are not deployed yet (no addresses in ...)
+  Fix: run ./scripts/deploy.sh testnet then ./scripts/record-deployments.sh testnet
+```
+
+### 7.3 Exit codes and output
+
+| Exit | Meaning |
+|---|---|
+| `0` | every check passed |
+| `1` | one or more checks failed (missing or mismatched address) |
+| `2` | could not run (not deployed yet, `soroban`/`jq` missing) |
+
+Every FAIL line names the getter, what it returned, what was expected, and the
+fix — for example:
+
+```
+[FAIL] registry:referral
+       RegistryContract::get_contract(referral) -> C... but Referral Contract is C...;
+       update the registry entry
+```
+
+### 7.4 Registering missing registry entries
+
+The default registry `Symbol` for each contract is its short name (`aid`,
+`treasury`, `referral`, `registry`, `governance`, ...). If the deployment used
+different names, pass `--registry-name <key>=<symbol>`. Register a missing
+entry with:
+
+```bash
+soroban contract invoke \
+  --id "$REGISTRY_ID" --network "$NETWORK" --source admin \
+  -- set_contract --caller admin --name referral \
+     --address "$REFERRAL_ID" --version 1
+```
+
+### 7.5 CI / automation
+
+```bash
+./scripts/verify-deployment.sh testnet --json
+```
+
+prints `{"network":...,"pass":N,"fail":N,"checks":[...]}` and exits non-zero on
+any failure, so it can gate a post-deploy job. It is intentionally **not** part
+of the PR CI job set, because it requires a live network and a funded source
+identity.

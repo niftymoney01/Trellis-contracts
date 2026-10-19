@@ -53,9 +53,16 @@
 use soroban_sdk::{contracttype, symbol_short, token, Address, Env, Symbol, Vec};
 
 use crate::errors::Error;
+use crate::telemetry::{
+    emit_failure, emit_success, ActorType, OP_ESCROW_CREATE, OP_ESCROW_RELEASE,
+    OP_PAYMENT_TRANSFER,
+};
 use crate::events::{
     emit, PAYMENT_ESCROW_CREATED, PAYMENT_ESCROW_REFUNDED, PAYMENT_ESCROW_RELEASED, PAYMENT_FEE,
     PAYMENT_TRANSFER,
+};
+use crate::jobs::{
+    enqueue_escrow_refund, EnqueueOutcome, Job, JobError, JobHandler, JobPayload,
 };
 use crate::storage::{persistent_get, persistent_read, persistent_set};
 
@@ -123,6 +130,24 @@ pub struct EscrowRecord {
     pub expiry_ledger: u32,
     /// Current lifecycle state.
     pub state: EscrowState,
+    /// Amount already released to beneficiary (for milestone releases).
+    pub released_amount: i128,
+    /// Amount already refunded to depositor (for dispute resolution).
+    pub refunded_amount: i128,
+    /// Milestone configuration (optional).
+    pub milestones: Option<soroban_sdk::Vec<Milestone>>,
+}
+
+/// A milestone in a multi-stage escrow release.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Milestone {
+    /// Milestone identifier.
+    pub id: u32,
+    /// Amount to release at this milestone.
+    pub amount: i128,
+    /// Whether this milestone has been released.
+    pub released: bool,
 }
 
 // ===========================================================================
@@ -206,12 +231,16 @@ pub fn safe_transfer(
     to: &Address,
     amount: i128,
 ) -> Result<(), Error> {
-    validate_amount(amount)?;
+    if let Err(err) = validate_amount(amount) {
+        emit_failure(env, OP_PAYMENT_TRANSFER, ActorType::User, 0);
+        return Err(err);
+    }
 
     let client = token::Client::new(env, token);
     client.transfer(from, to, &amount);
 
     emit(env, PAYMENT_TRANSFER, (from.clone(), to.clone(), amount));
+    emit_success(env, OP_PAYMENT_TRANSFER, ActorType::User, 0);
     Ok(())
 }
 
@@ -365,10 +394,14 @@ pub fn create_escrow(
     amount: i128,
     expiry_ledger: u32,
 ) -> Result<u64, Error> {
-    validate_amount(amount)?;
+    if let Err(err) = validate_amount(amount) {
+        emit_failure(env, OP_ESCROW_CREATE, ActorType::User, 0);
+        return Err(err);
+    }
 
     let current_seq = env.ledger().sequence();
     if expiry_ledger <= current_seq {
+        emit_failure(env, OP_ESCROW_CREATE, ActorType::User, 0);
         return Err(Error::InvalidArgument);
     }
 
@@ -384,6 +417,9 @@ pub fn create_escrow(
         amount,
         expiry_ledger,
         state: EscrowState::Active,
+        released_amount: 0,
+        refunded_amount: 0,
+        milestones: None,
     };
     store_escrow(env, &record);
 
@@ -403,6 +439,8 @@ pub fn create_escrow(
         ),
     );
 
+    emit_success(env, OP_ESCROW_CREATE, ActorType::User, 0);
+
     Ok(escrow_id)
 }
 
@@ -420,19 +458,24 @@ pub fn create_escrow(
 /// # Events
 /// Emits [`PAYMENT_ESCROW_RELEASED`] with `(escrow_id, beneficiary, amount)`.
 pub fn release_escrow(env: &Env, token: &Address, escrow_id: u64) -> Result<(), Error> {
-    let mut record: EscrowRecord =
-        persistent_read(env, &escrow_key(escrow_id)).ok_or(Error::PaymentEscrowNotFound)?;
+    let Some(mut record): Option<EscrowRecord> = persistent_read(env, &escrow_key(escrow_id)) else {
+        emit_failure(env, OP_ESCROW_RELEASE, ActorType::User, 0);
+        return Err(Error::PaymentEscrowNotFound);
+    };
 
     if record.state == EscrowState::Released {
+        emit_failure(env, OP_ESCROW_RELEASE, ActorType::User, 0);
         return Err(Error::PaymentEscrowAlreadyReleased);
     }
     if record.state == EscrowState::Refunded {
+        emit_failure(env, OP_ESCROW_RELEASE, ActorType::User, 0);
         return Err(Error::PaymentEscrowAlreadyRefunded);
     }
 
     // Check expiry — release is only possible before or at the expiry ledger.
     let current_seq = env.ledger().sequence();
     if current_seq > record.expiry_ledger {
+        emit_failure(env, OP_ESCROW_RELEASE, ActorType::User, 0);
         return Err(Error::PaymentEscrowExpired);
     }
 
@@ -454,6 +497,8 @@ pub fn release_escrow(env: &Env, token: &Address, escrow_id: u64) -> Result<(), 
         PAYMENT_ESCROW_RELEASED,
         (escrow_id, record.beneficiary, record.amount),
     );
+
+    emit_success(env, OP_ESCROW_RELEASE, ActorType::User, 0);
 
     Ok(())
 }
@@ -502,6 +547,224 @@ pub fn refund_escrow(env: &Env, token: &Address, escrow_id: u64) -> Result<(), E
     );
 
     Ok(())
+}
+
+/// Release a milestone amount from an escrow deposit.
+///
+/// Allows partial releases for multi-stage payments. The amount must not
+/// exceed the remaining unreleased amount.
+///
+/// # Errors
+/// * [`Error::PaymentEscrowNotFound`] — no record for `escrow_id`.
+/// * [`Error::PaymentEscrowAlreadyReleased`] — escrow is fully released.
+/// * [`Error::PaymentEscrowAlreadyRefunded`] — escrow is already refunded.
+/// * [`Error::PaymentInvalidAmount`] — amount exceeds remaining balance.
+///
+/// # Events
+/// Emits [`PAYMENT_ESCROW_RELEASED`] with `(escrow_id, beneficiary, amount)`.
+pub fn release_milestone(
+    env: &Env,
+    token: &Address,
+    escrow_id: u64,
+    amount: i128,
+) -> Result<(), Error> {
+    validate_amount(amount)?;
+
+    let mut record: EscrowRecord =
+        persistent_read(env, &escrow_key(escrow_id)).ok_or(Error::PaymentEscrowNotFound)?;
+
+    if record.state == EscrowState::Refunded {
+        return Err(Error::PaymentEscrowAlreadyRefunded);
+    }
+
+    let remaining = record.amount - record.released_amount - record.refunded_amount;
+    if amount > remaining {
+        return Err(Error::PaymentInvalidAmount);
+    }
+
+    // Update released amount before transfer.
+    record.released_amount = record
+        .released_amount
+        .checked_add(amount)
+        .ok_or(Error::PaymentFeeOverflow)?;
+
+    // Check if fully released.
+    if record.released_amount == record.amount {
+        record.state = EscrowState::Released;
+        remove_from_active(env, escrow_id);
+    }
+
+    persistent_set(env, &escrow_key(escrow_id), &record);
+
+    // Transfer from contract to beneficiary.
+    let client = token::Client::new(env, token);
+    client.transfer(
+        &env.current_contract_address(),
+        &record.beneficiary,
+        &amount,
+    );
+
+    emit(
+        env,
+        PAYMENT_ESCROW_RELEASED,
+        (escrow_id, record.beneficiary, amount),
+    );
+
+    Ok(())
+}
+
+/// Resolve a dispute by splitting escrowed funds between depositor and beneficiary.
+///
+/// Allows partial arbitration in case of disputes. The total split must equal
+/// the remaining escrowed amount.
+///
+/// # Errors
+/// * [`Error::PaymentEscrowNotFound`] — no record for `escrow_id`.
+/// * [`Error::PaymentEscrowAlreadyReleased`] — escrow is fully released.
+/// * [`Error::PaymentEscrowAlreadyRefunded`] — escrow is already refunded.
+/// * [`Error::PaymentInvalidAmount`] — split amounts don't match remaining balance.
+///
+/// # Events
+/// Emits both [`PAYMENT_ESCROW_RELEASED`] and [`PAYMENT_ESCROW_REFUNDED`].
+pub fn resolve_dispute(
+    env: &Env,
+    token: &Address,
+    escrow_id: u64,
+    beneficiary_amount: i128,
+    refund_amount: i128,
+) -> Result<(), Error> {
+    let mut record: EscrowRecord =
+        persistent_read(env, &escrow_key(escrow_id)).ok_or(Error::PaymentEscrowNotFound)?;
+
+    if record.state == EscrowState::Released {
+        return Err(Error::PaymentEscrowAlreadyReleased);
+    }
+    if record.state == EscrowState::Refunded {
+        return Err(Error::PaymentEscrowAlreadyRefunded);
+    }
+
+    let remaining = record.amount - record.released_amount - record.refunded_amount;
+    if beneficiary_amount + refund_amount != remaining {
+        return Err(Error::PaymentInvalidAmount);
+    }
+
+    // Update amounts before transfers.
+    record.released_amount = record
+        .released_amount
+        .checked_add(beneficiary_amount)
+        .ok_or(Error::PaymentFeeOverflow)?;
+    record.refunded_amount = record
+        .refunded_amount
+        .checked_add(refund_amount)
+        .ok_or(Error::PaymentFeeOverflow)?;
+
+    // Mark as fully resolved.
+    record.state = EscrowState::Released;
+    remove_from_active(env, escrow_id);
+
+    persistent_set(env, &escrow_key(escrow_id), &record);
+
+    let client = token::Client::new(env, token);
+
+    // Transfer beneficiary portion.
+    if beneficiary_amount > 0 {
+        client.transfer(
+            &env.current_contract_address(),
+            &record.beneficiary,
+            &beneficiary_amount,
+        );
+        emit(
+            env,
+            PAYMENT_ESCROW_RELEASED,
+            (escrow_id, record.beneficiary, beneficiary_amount),
+        );
+    }
+
+    // Transfer refund portion.
+    if refund_amount > 0 {
+        client.transfer(
+            &env.current_contract_address(),
+            &record.depositor,
+            &refund_amount,
+        );
+        emit(
+            env,
+            PAYMENT_ESCROW_REFUNDED,
+            (escrow_id, record.depositor, refund_amount),
+        );
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// Background worker integration (Issue #35)
+// ===========================================================================
+
+/// Job handler that refunds an escrow deposit through the worker framework.
+///
+/// A refund is only valid once `expiry_ledger` has passed, so the work is
+/// inherently delayed. Instead of every caller polling [`refund_escrow`] until
+/// it stops returning [`Error::PaymentEscrowNotExpired`], the deposit can be
+/// *scheduled* as a job and the crank retries it with backoff until it
+/// succeeds — and dead-letters it with full context if it never does.
+pub struct EscrowRefundHandler;
+
+impl JobHandler for EscrowRefundHandler {
+    fn handle(&self, env: &Env, job: &Job) -> Result<(), Error> {
+        match &job.payload {
+            JobPayload::EscrowRefund(token, escrow_id) => refund_escrow(env, token, *escrow_id),
+            _ => Err(Error::InvalidArgument),
+        }
+    }
+}
+
+/// Schedule the refund of an escrow deposit for its expiry ledger.
+///
+/// Idempotent per `escrow_id`: re-scheduling an escrow whose refund is still
+/// queued, or already completed, returns the existing job instead of
+/// duplicating the work.
+pub fn schedule_escrow_refund(
+    env: &Env,
+    token: &Address,
+    escrow_id: u64,
+    expiry_ledger: u32,
+) -> Result<EnqueueOutcome, JobError> {
+    enqueue_escrow_refund(env, token.clone(), escrow_id, expiry_ledger)
+}
+
+/// Create an escrow deposit **and** schedule its expiry refund as a job.
+///
+/// This is the delayed half of the escrow lifecycle moved into the worker
+/// framework: the deposit is still created atomically, but the refund is
+/// handed to the worker (retries, backoff, dead-letter) instead of waiting for
+/// an external caller to poll [`refund_escrow`].
+///
+/// # Errors
+/// Everything [`create_escrow`] can return, plus [`Error::ContractPaused`]
+/// when the worker is disabled and [`Error::ConfigInvalid`] when its retry
+/// policy is unusable.
+pub fn create_escrow_with_refund_job(
+    env: &Env,
+    token: &Address,
+    depositor: &Address,
+    beneficiary: &Address,
+    amount: i128,
+    expiry_ledger: u32,
+) -> Result<(u64, EnqueueOutcome), Error> {
+    let escrow_id = create_escrow(env, token, depositor, beneficiary, amount, expiry_ledger)?;
+    let outcome = schedule_escrow_refund(env, token, escrow_id, expiry_ledger)
+        .map_err(worker_error_to_contract_error)?;
+    Ok((escrow_id, outcome))
+}
+
+/// Translate a framework error into the shared contract error space.
+fn worker_error_to_contract_error(err: JobError) -> Error {
+    match err {
+        JobError::Disabled => Error::ContractPaused,
+        JobError::InvalidPolicy => Error::ConfigInvalid,
+        _ => Error::InvalidArgument,
+    }
 }
 
 /// Read an escrow record by ID.

@@ -13,6 +13,7 @@
 //! |--------------------|-----------------------|-----------------------------|
 //! | User timeline      | [`append_user_event`] | [`timeline_page`]           |
 //! | Maintainer audit   | [`record_audit_event`]| [`audit_trail`]             |
+//! | Domain action log  | [`record_action_audit_event`]| [`action_audit_trail`] |
 //!
 //! The stores live under different storage keys and have different accessors,
 //! so a maintainer-only entry is structurally incapable of appearing in a
@@ -51,7 +52,10 @@
 
 use soroban_sdk::{contracttype, symbol_short, Address, Bytes, BytesN, Env, Symbol, Vec};
 
-use crate::auth::{has_role, require_role, Role};
+use crate::auth::{
+    has_permission, has_role, require_admin, require_permission, require_role, Permission, Role,
+    KEY_ADMIN,
+};
 use crate::canonical::{canonical_fingerprint, CanonicalPart};
 use crate::errors::Error;
 use crate::storage::{persistent_get, persistent_has, persistent_remove, persistent_set};
@@ -115,6 +119,13 @@ pub enum TimelineEventType {
     ContractPaused,
     /// The contract resumed.
     ContractResumed,
+    /// A scheduled action was rejected because it was attempted before its
+    /// valid time window opened.
+    ScheduledActionEarly,
+    /// A scheduled action was rejected because its time window had expired.
+    ScheduledActionLate,
+    /// An action was rejected.
+    ActionRejected,
 }
 
 /// A stable pointer at the resource an entry describes.
@@ -190,7 +201,7 @@ pub struct AuditEntry {
     pub event_type: TimelineEventType,
     /// The resource it happened to.
     pub link: ResourceLink,
-    /// The maintainer that recorded or performed it.
+    /// The authenticated actor that recorded or performed it.
     pub actor: Address,
     /// Ledger sequence at which it was recorded.
     pub ledger: u32,
@@ -198,6 +209,38 @@ pub struct AuditEntry {
     pub timestamp: u64,
     /// Short label.
     pub summary: Symbol,
+}
+
+/// Versioned, structured audit context for a sensitive domain action.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionAuditEntry {
+    /// Append-only position in the shared audit sequence.
+    pub seq: u64,
+    /// What happened.
+    pub event_type: TimelineEventType,
+    /// The resource it happened to.
+    pub link: ResourceLink,
+    /// The authenticated actor.
+    pub actor: Address,
+    /// Contract or protocol area in which the action occurred.
+    pub scope: Symbol,
+    /// Stable action label; free-form input does not belong in audit records.
+    pub action: Symbol,
+    /// Short, non-sensitive reason code for the action.
+    pub reason: Symbol,
+    /// Public resource address affected by the action, when applicable.
+    pub resource: Option<Address>,
+    /// Stable attribute such as a category or role, when applicable.
+    pub attribute: Option<Symbol>,
+    /// Non-sensitive numeric state immediately before the action, when relevant.
+    pub before: Option<i128>,
+    /// Non-sensitive numeric state immediately after the action, when relevant.
+    pub after: Option<i128>,
+    /// Ledger sequence at which it was recorded.
+    pub ledger: u32,
+    /// Ledger timestamp at which it was recorded.
+    pub timestamp: u64,
 }
 
 /// Who is asking to read a timeline.
@@ -235,6 +278,193 @@ pub enum TimelineKey {
     NextAuditSeq,
     /// Maintainer-only audit entry by `seq`.
     AuditEntry(u64),
+    /// Versioned domain-action audit entry by `seq`.
+    ActionAuditEntry(u64),
+    /// Time-window configuration for a scheduled action, keyed by action id.
+    ScheduledWindow(u64),
+    /// Execution record for a scheduled action, keyed by action id.
+    ScheduledExecution(u64),
+}
+
+// ---------------------------------------------------------------------------
+// Time-window validation
+// ---------------------------------------------------------------------------
+
+/// A half-open ledger-time window `[start, end)` during which a scheduled
+/// action may execute.
+///
+/// `start` is inclusive and `end` is exclusive, so an action attempted exactly
+/// at `start` is valid and one attempted exactly at `end` is late. `stale_after`
+/// is an optional absolute ledger timestamp beyond which the action is
+/// considered stale even if the window has not formally closed; when `None`,
+/// staleness is governed solely by `end`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimeWindow {
+    /// Earliest ledger timestamp at which the action may execute (inclusive).
+    pub start: u64,
+    /// Ledger timestamp at which the window closes (exclusive).
+    pub end: u64,
+    /// Optional absolute staleness cutoff; must be `<= end` when set.
+    pub stale_after: Option<u64>,
+}
+
+/// Outcome of validating a scheduled action against its window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WindowStatus {
+    /// The action may execute now.
+    Valid,
+    /// The action was attempted before `start`.
+    Early,
+    /// The action was attempted at or after `end`.
+    Late,
+    /// The action was attempted at or after `stale_after`.
+    Stale,
+}
+
+impl TimeWindow {
+    /// Validates `now` against this window, returning the precise failure mode.
+    ///
+    /// Ordering of checks matters: an action attempted before `start` is always
+    /// `Early` even if `stale_after` has also passed (which can only happen if
+    /// the window was misconfigured), so callers get the most actionable error.
+    pub fn validate(&self, now: u64) -> WindowStatus {
+        if now < self.start {
+            return WindowStatus::Early;
+        }
+        if now >= self.end {
+            return WindowStatus::Late;
+        }
+        if let Some(stale) = self.stale_after {
+            if now >= stale {
+                return WindowStatus::Stale;
+            }
+        }
+        WindowStatus::Valid
+    }
+
+    /// Returns `true` when `start < end` and any `stale_after` is `<= end`.
+    pub fn is_well_formed(&self) -> bool {
+        if self.start >= self.end {
+            return false;
+        }
+        match self.stale_after {
+            Some(stale) => stale <= self.end,
+            None => true,
+        }
+    }
+}
+
+/// Persists the time window for a scheduled action.
+///
+/// Rejects malformed windows with [`Error::InvalidArgument`] so a bad window
+/// can never be stored and later silently reject every execution attempt.
+pub fn set_scheduled_window(env: &Env, action_id: u64, window: TimeWindow) -> Result<(), Error> {
+    if !window.is_well_formed() {
+        return Err(Error::InvalidArgument);
+    }
+    persistent_set(env, &TimelineKey::ScheduledWindow(action_id), &window);
+    Ok(())
+}
+
+/// Loads the time window for a scheduled action, if one was configured.
+pub fn scheduled_window(env: &Env, action_id: u64) -> Option<TimeWindow> {
+    persistent_get(env, &TimelineKey::ScheduledWindow(action_id))
+}
+
+/// Validates a scheduled action against its configured window using the
+/// current ledger timestamp.
+///
+/// Returns [`Error::NotFound`] when no window is configured for `action_id`,
+/// [`Error::InvalidArgument`] when the stored window is malformed, and
+/// [`Error::Unauthorized`] when the action is early, late, or stale. The
+/// specific failure is also emitted as a ledger event so off-chain monitors
+/// can distinguish the three cases without parsing error codes.
+pub fn validate_scheduled_action(
+    env: &Env,
+    action_id: u64,
+    link: &ResourceLink,
+) -> Result<TimeWindow, Error> {
+    let window = scheduled_window(env, action_id).ok_or(Error::NotFound)?;
+    if !window.is_well_formed() {
+        return Err(Error::InvalidArgument);
+    }
+    let now = env.ledger().timestamp();
+    match window.validate(now) {
+        WindowStatus::Valid => Ok(window),
+        WindowStatus::Early => {
+            env.events().publish(
+                (symbol_short!("timeline"), Symbol::new(env, "sched_early")),
+                (action_id, now, window.start),
+            );
+            Err(Error::Unauthorized)
+        }
+        WindowStatus::Late => {
+            env.events().publish(
+                (symbol_short!("timeline"), Symbol::new(env, "sched_late")),
+                (action_id, now, window.end),
+            );
+            Err(Error::Unauthorized)
+        }
+        WindowStatus::Stale => {
+            let stale = window.stale_after.unwrap_or(window.end);
+            env.events().publish(
+                (symbol_short!("timeline"), Symbol::new(env, "sched_stale")),
+                (action_id, now, stale),
+            );
+            Err(Error::Unauthorized)
+        }
+    }
+}
+
+/// Records that a scheduled action executed inside its window.
+///
+/// Must be called only after [`validate_scheduled_action`] has succeeded and
+/// the domain operation's own authorization has passed. Writes an audit entry
+/// so maintainers can review scheduled executions, and emits a user-facing
+/// timeline entry so the subject can see the action occurred.
+pub fn record_scheduled_execution(
+    env: &Env,
+    actor: &Address,
+    action_id: u64,
+    link: ResourceLink,
+    summary: Symbol,
+) -> Result<(), Error> {
+    let window = validate_scheduled_action(env, action_id, &link)?;
+    let now = env.ledger().timestamp();
+    persistent_set(
+        env,
+        &TimelineKey::ScheduledExecution(action_id),
+        &(now, actor.clone()),
+    );
+    write_audit_entry(
+        env,
+        actor.clone(),
+        TimelineEventType::RecordSettled,
+        link.clone(),
+        summary.clone(),
+    )?;
+    append_user_event(
+        env,
+        Some(actor.clone()),
+        TimelineEventType::RecordSettled,
+        Visibility::Participant,
+        link,
+        Some(actor.clone()),
+        summary,
+    )?;
+    env.events().publish(
+        (symbol_short!("timeline"), Symbol::new(env, "sched_exec")),
+        (action_id, now, window.start, window.end),
+    );
+    Ok(())
+}
+
+/// Returns the ledger timestamp at which `action_id` last executed, if ever.
+pub fn scheduled_execution_time(env: &Env, action_id: u64) -> Option<u64> {
+    persistent_get::<_, (u64, Address)>(env, &TimelineKey::ScheduledExecution(action_id))
+        .map(|(ts, _)| ts)
 }
 
 // ---------------------------------------------------------------------------
@@ -246,7 +476,24 @@ pub enum TimelineKey {
 /// Maintainer status is `Role::Admin` or `Role::Upgrader`, read from on-chain
 /// role storage.
 pub fn is_maintainer(env: &Env, who: &Address) -> bool {
-    has_role(env, who, Role::Admin) || has_role(env, who, Role::Upgrader)
+    has_role(env, who, Role::Admin)
+        || has_role(env, who, Role::Upgrader)
+        || env
+            .storage()
+            .instance()
+            .get::<_, Address>(&KEY_ADMIN)
+            .as_ref()
+            == Some(who)
+}
+
+fn require_audit_reader(env: &Env, maintainer: &Address) -> Result<(), Error> {
+    if has_permission(env, maintainer, Permission::ReadAuditTrail) {
+        require_permission(env, maintainer, Permission::ReadAuditTrail)
+    } else if env.storage().instance().has(&KEY_ADMIN) {
+        require_admin(env, maintainer)
+    } else {
+        Err(Error::Unauthorized)
+    }
 }
 
 /// Builds the [`Viewer`] for `who` by reading their on-chain roles.
@@ -329,6 +576,10 @@ fn load_entry(env: &Env, seq: u64) -> Option<TimelineEntry> {
 
 fn load_audit_entry(env: &Env, seq: u64) -> Option<AuditEntry> {
     persistent_get(env, &TimelineKey::AuditEntry(seq))
+}
+
+fn load_action_audit_entry(env: &Env, seq: u64) -> Option<ActionAuditEntry> {
+    persistent_get(env, &TimelineKey::ActionAuditEntry(seq))
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +665,47 @@ fn write_audit_entry(
     Ok(entry)
 }
 
+fn write_action_audit_entry(
+    env: &Env,
+    actor: Address,
+    event_type: TimelineEventType,
+    link: ResourceLink,
+    scope: Symbol,
+    action: Symbol,
+    reason: Symbol,
+    resource: Option<Address>,
+    attribute: Option<Symbol>,
+    before: Option<i128>,
+    after: Option<i128>,
+) -> Result<ActionAuditEntry, Error> {
+    link.anchor(env)?;
+    let entry = ActionAuditEntry {
+        seq: take_audit_seq(env),
+        event_type,
+        link,
+        actor,
+        scope,
+        action,
+        reason,
+        resource,
+        attribute,
+        before,
+        after,
+        ledger: env.ledger().sequence(),
+        timestamp: env.ledger().timestamp(),
+    };
+    persistent_set(env, &TimelineKey::ActionAuditEntry(entry.seq), &entry);
+    env.events().publish(
+        (symbol_short!("timeline"), symbol_short!("audit")),
+        (entry.seq, entry.event_type.clone(), entry.link.clone()),
+    );
+    env.events().publish(
+        (symbol_short!("timeline"), symbol_short!("audit_v2")),
+        entry.clone(),
+    );
+    Ok(entry)
+}
+
 /// Records a maintainer-only audit entry.
 ///
 /// Maintainer-gated: the caller must hold [`Role::Admin`]. Audit entries are
@@ -426,8 +718,42 @@ pub fn record_audit_event(
     link: ResourceLink,
     summary: Symbol,
 ) -> Result<AuditEntry, Error> {
-    require_role(env, maintainer, Role::Admin)?;
+    require_audit_reader(env, maintainer)?;
     write_audit_entry(env, maintainer.clone(), event_type, link, summary)
+}
+
+/// Records an authenticated domain action for maintainer review.
+///
+/// Call only after the domain operation's authorization and validation have
+/// succeeded. The event and state change are committed atomically by Soroban.
+/// Context is limited to stable symbols and optional numeric values so callers
+/// do not persist secrets, free-form payloads, or personal data unnecessarily.
+pub fn record_action_audit_event(
+    env: &Env,
+    actor: &Address,
+    event_type: TimelineEventType,
+    link: ResourceLink,
+    scope: Symbol,
+    action: Symbol,
+    reason: Symbol,
+    resource: Option<Address>,
+    attribute: Option<Symbol>,
+    before: Option<i128>,
+    after: Option<i128>,
+) -> Result<ActionAuditEntry, Error> {
+    write_action_audit_entry(
+        env,
+        actor.clone(),
+        event_type,
+        link,
+        scope,
+        action,
+        reason,
+        resource,
+        attribute,
+        before,
+        after,
+    )
 }
 
 /// Hides an entry from every non-maintainer without disturbing ordering.
@@ -441,7 +767,7 @@ pub fn redact_entry(
     seq: u64,
     reason: Symbol,
 ) -> Result<(), Error> {
-    require_role(env, maintainer, Role::Admin)?;
+    require_audit_reader(env, maintainer)?;
     let mut entry = load_entry(env, seq).ok_or(Error::NotFound)?;
     entry.redacted = true;
     let link = entry.link.clone();
@@ -539,7 +865,7 @@ pub fn timeline_page(
     // Resume from the last sequence number actually examined, which may be a
     // hidden or deleted one — that is what keeps a filtered page from skipping
     // entries when the caller comes back.
-    let next_cursor = if has_more || !entries.is_empty() {
+    let next_cursor = if has_more {
         Some(next.saturating_sub(1))
     } else {
         None
@@ -569,6 +895,34 @@ pub fn audit_trail(env: &Env, maintainer: &Address, limit: u32) -> Result<Vec<Au
     while seq > 0 && out.len() < limit {
         seq -= 1;
         if let Some(entry) = load_audit_entry(env, seq) {
+            out.push_back(entry);
+        }
+    }
+    Ok(out)
+}
+
+/// Returns structured domain-action records, newest first.
+///
+/// Maintainer-gated and stored separately from the legacy audit-entry schema,
+/// preserving compatibility with audit entries written before structured
+/// action context was added.
+pub fn action_audit_trail(
+    env: &Env,
+    maintainer: &Address,
+    limit: u32,
+) -> Result<Vec<ActionAuditEntry>, Error> {
+    require_role(env, maintainer, Role::Admin)?;
+    let limit = if limit == 0 { DEFAULT_PAGE_SIZE } else { limit };
+    if limit > MAX_PAGE_SIZE {
+        return Err(Error::InvalidArgument);
+    }
+
+    let total = next_audit_seq(env);
+    let mut out = Vec::new(env);
+    let mut seq = total;
+    while seq > 0 && out.len() < limit {
+        seq -= 1;
+        if let Some(entry) = load_action_audit_entry(env, seq) {
             out.push_back(entry);
         }
     }
